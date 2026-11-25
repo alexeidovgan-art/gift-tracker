@@ -1,12 +1,10 @@
 """
-Gift Market Tracker v6
+Gift Market Tracker v6 (flood-safe)
 
 - Только подарки на аккаунте Telegram (есть owner_id, нет owner_address).
-- Только лоты, у владельца которых ЕСТЬ юзернейм (иначе профиль не открыть).
-- Занятие лога мгновенное: блокировка и правка сообщения в группе без сетевых
-  запросов. Личка уходит сразу после этого.
-- После занятия бот в фоне перепроверяет владельца. Если подарок сменил
-  владельца или ушёл в блокчейн, claimer получает предупреждение.
+- Только лоты, у владельца которых ЕСТЬ юзернейм.
+- Мгновенное занятие лога: блокировка и правка сообщения в группе без сетевых запросов.
+- После занятия в фоне перепроверяется владелец.
 
 Локально / VPS:       pip install -U telethon ; python gift_tracker.py
 Render (без карты):   переменные API_ID, API_HASH, BOT_TOKEN, TG_SESSION
@@ -15,7 +13,7 @@ Render (без карты):   переменные API_ID, API_HASH, BOT_TOKEN, 
 
 В Telegram:
     /here              — в группе: привязать группу
-    /settopic cheap    — внутри темы (cheap / mid / expensive)
+    /settopic cheap    — внутри темы (cheap / mid / expensive), С ПРОБЕЛОМ
     /start             — боту в личку (обязательно для занятия логов)
     /auto или /watch X — что отслеживать
     /tier 15 50        — пороги: дёшево ≤ +15% к флору, средне ≤ +50%
@@ -35,10 +33,10 @@ from telethon.sessions import StringSession
 from telethon.tl.custom import Button
 
 CFG_FILE = "config.json"
-POLL_EVERY = 1.0
+POLL_EVERY = 3.0       # пауза между опросами одной коллекции, сек (меньше = риск flood wait)
 LIMIT = 15
-TOP_N = 8
-FLOOR_REFRESH = 25
+TOP_N = 3              # авто-режим: сколько коллекций
+FLOOR_REFRESH = 120    # обновление флора, сек
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("tracker")
@@ -165,7 +163,7 @@ async def floor_refresher():
                 await asyncio.sleep(e.seconds + 1)
             except Exception:
                 pass
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
         await asyncio.sleep(FLOOR_REFRESH)
 
 
@@ -261,7 +259,7 @@ async def watch(gift):
                 owner_id = g.owner_id.user_id
                 owner_uname = username_of(users_map.get(owner_id))
                 if not owner_uname:
-                    continue  # нет юзернейма — профиль не открыть, пропускаем
+                    continue
                 asyncio.create_task(post_lot(g, owner_id, owner_uname, gift.id,
                                              gift.title, price_text, stars))
             first = False
@@ -293,7 +291,6 @@ def build_detail(lot):
 
 
 async def verify_owner(lot, claimer_id):
-    """Фоновая проверка: владелец не сменился и подарок всё ещё на аккаунте."""
     await asyncio.sleep(3)
     try:
         res = await user(functions.payments.GetUniqueStarGiftRequest(slug=lot["slug"]))
@@ -328,23 +325,19 @@ async def on_callback(e):
         await e.answer(f"Уже занято (@{who})" if who else "Уже занято", alert=True)
         return
 
-    # Мгновенная блокировка: без сетевых запросов до этого момента
     lot["claimed"] = True
     sender = e.sender
     cname = username_of(sender) or getattr(sender, "first_name", None) or str(e.sender_id)
     lot["claimer"] = cname
 
-    # 1) Группа: лог не исчезает, меняется только кнопка. Текст передаём явно.
     try:
         await e.edit(lot["group_text"], parse_mode="html",
                      buttons=[[Button.inline(f"🔒 Занято (@{cname})", data="noop")]])
     except Exception:
         log.exception("Не удалось обновить сообщение в группе")
 
-    # 2) Ответ на нажатие — сразу
     await e.answer("Лог твой! Детали в личке у бота.")
 
-    # 3) Личка с владельцем и ссылкой на подарок
     text, buttons = build_detail(lot)
     try:
         await bot.send_message(e.sender_id, text, buttons=buttons,
@@ -358,7 +351,6 @@ async def on_callback(e):
         )
         return
 
-    # 4) В фоне — перепроверка владельца
     asyncio.create_task(verify_owner(lot, e.sender_id))
 
 
@@ -383,7 +375,7 @@ async def on_msg(e):
     if cmd == "/here":
         cfg["group_id"] = e.chat_id
         save_cfg()
-        await e.respond("✅ Группа привязана. Теперь в каждой теме напиши /settopic.", parse_mode=None)
+        await e.respond("✅ Группа привязана. Теперь в каждой теме напиши /settopic cheap (или mid / expensive).", parse_mode=None)
         return
 
     if e.chat_id != cfg.get("group_id"):
