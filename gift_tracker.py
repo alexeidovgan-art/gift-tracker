@@ -1,10 +1,12 @@
 """
-Gift Market Tracker v6 (flood-safe)
+Gift Market Tracker v7 — контролируемый темп запросов
 
 - Только подарки на аккаунте Telegram (есть owner_id, нет owner_address).
-- Только лоты, у владельца которых ЕСТЬ юзернейм.
-- Мгновенное занятие лога: блокировка и правка сообщения в группе без сетевых запросов.
-- После занятия в фоне перепроверяется владелец.
+- Только лоты, у владельца которых есть юзернейм.
+- Общий темп запросов к маркету задаётся /rate (по умолчанию 8 в минуту).
+  Бот по очереди обходит выбранные коллекции и при флуд-ограничении
+  сам притормаживает.
+- Занятие лога мгновенное: блокировка и правка сообщения без сетевых запросов.
 
 Локально / VPS:       pip install -U telethon ; python gift_tracker.py
 Render (без карты):   переменные API_ID, API_HASH, BOT_TOKEN, TG_SESSION
@@ -15,7 +17,9 @@ Render (без карты):   переменные API_ID, API_HASH, BOT_TOKEN, 
     /here              — в группе: привязать группу
     /settopic cheap    — внутри темы (cheap / mid / expensive), С ПРОБЕЛОМ
     /start             — боту в личку (обязательно для занятия логов)
-    /auto или /watch X — что отслеживать
+    /watch X, /unwatch X — коллекции (лучше 4–6)
+    /auto              — топ-коллекции по ликвидности
+    /rate 8            — запросов к маркету в минуту (меньше = меньше флуда, медленнее)
     /tier 15 50        — пороги: дёшево ≤ +15% к флору, средне ≤ +50%
     /status            — проверка
 """
@@ -24,6 +28,7 @@ import json
 import logging
 import os
 import threading
+import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import count
@@ -33,17 +38,19 @@ from telethon.sessions import StringSession
 from telethon.tl.custom import Button
 
 CFG_FILE = "config.json"
-POLL_EVERY = 3.0       # пауза между опросами одной коллекции, сек (меньше = риск flood wait)
-LIMIT = 15
-TOP_N = 3              # авто-режим: сколько коллекций
-FLOOR_REFRESH = 120    # обновление флора, сек
+LIMIT = 30              # свежих лотов за один запрос
+TOP_N = 4               # авто-режим: сколько коллекций
+FLOOR_EVERY = 600       # как часто проверять флор по коллекции, сек
+MAX_SEEN = 100_000      # защита памяти
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("tracker")
 
 TIER_LABEL = {"cheap": "ДЕШЁВЫЕ", "mid": "СРЕДНИЕ", "expensive": "ДОРОГИЕ"}
 
-cfg, tasks, gifts, lots, floor_cache = {}, {}, {}, {}, {}
+cfg, gifts, lots, floor_cache, floor_ts = {}, {}, {}, {}, {}
+seen, baselined = {}, set()
+state = {"interval": 60 / 8}
 lot_counter = count(1)
 user = bot = None
 
@@ -79,9 +86,11 @@ def load_cfg():
     cfg.setdefault("topics", {})
     cfg.setdefault("started", [])
     cfg.setdefault("watch", [])
+    cfg.setdefault("rate", 8)
     cfg.setdefault("tier_cheap", 1.15)
     cfg.setdefault("tier_mid", 1.5)
     cfg.setdefault("stars_per_ton", 63.4)
+    state["interval"] = 60 / cfg["rate"]
     save_cfg()
 
 
@@ -138,35 +147,7 @@ def chosen_ids():
     return [g.id for g in top[:TOP_N]]
 
 
-def sync_tasks():
-    want = set(chosen_ids())
-    for gid in list(tasks):
-        if gid not in want:
-            tasks.pop(gid).cancel()
-    for gid in want:
-        if gid not in tasks:
-            tasks[gid] = asyncio.create_task(watch(gifts[gid]))
-
-
 # ───────────── флор и тир ─────────────
-async def floor_refresher():
-    while True:
-        for gid in list(tasks.keys()):
-            try:
-                r = await user(functions.payments.GetResaleStarGiftsRequest(
-                    gift_id=gid, sort_by_price=True, offset="", limit=1))
-                if r.gifts:
-                    _, stars = price_of(r.gifts[0])
-                    if stars:
-                        floor_cache[gid] = stars
-            except errors.FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
-            except Exception:
-                pass
-            await asyncio.sleep(5)
-        await asyncio.sleep(FLOOR_REFRESH)
-
-
 def classify(gid, gift_title, model_name, stars):
     if stars is None:
         return "mid"
@@ -228,50 +209,76 @@ async def post_lot(g, owner_id, owner_uname, gift_id, gift_title, price_text, st
         f"⚡ Статус: —"
     )
     lots[lot_id] = dict(
-        claimed=False, claimer=None, group_text=group_text, msg=None,
+        claimed=False, claimer=None, group_text=group_text,
         title=g.title, num=g.num, slug=g.slug, price=price_text, model=model,
         owner_id=owner_id, owner_uname=owner_uname,
     )
     btn = [[Button.inline("📣 Занять лог", data=f"occ_{lot_id}")]]
     msg = await send_to_topic(tier, group_text, btn)
-    if msg:
-        lots[lot_id]["msg"] = msg
-    else:
+    if not msg:
         lots.pop(lot_id, None)
 
 
-async def watch(gift):
-    seen, first = {}, True
+def handle_listing(gid, r, baseline):
+    if len(seen) > MAX_SEEN:
+        seen.clear()
+    users_map = {u.id: u for u in getattr(r, "users", None) or []}
+    for g in r.gifts:
+        if not is_account_gift(g):
+            continue
+        price_text, stars = price_of(g)
+        key = (gid, g.id)
+        if seen.get(key) == price_text:
+            continue
+        seen[key] = price_text
+        if baseline:
+            continue  # первый проход: запоминаем, но не постим старые лоты
+        owner_id = g.owner_id.user_id
+        owner_uname = username_of(users_map.get(owner_id))
+        if not owner_uname:
+            continue
+        gift = gifts.get(gid)
+        asyncio.create_task(post_lot(g, owner_id, owner_uname, gid,
+                                     gift.title if gift else "", price_text, stars))
+
+
+async def scheduler():
+    """Один цикл на все коллекции, общий темп = cfg['rate'] запросов в минуту."""
+    idx = 0
     while True:
+        ids = chosen_ids()
+        if not ids:
+            await asyncio.sleep(5)
+            continue
+        idx %= len(ids)
+        gid = ids[idx]
+        idx += 1
         try:
-            r = await user(functions.payments.GetResaleStarGiftsRequest(
-                gift_id=gift.id, offset="", limit=LIMIT))
-            users_map = {u.id: u for u in getattr(r, "users", None) or []}
-            for g in r.gifts:
-                if not is_account_gift(g):
-                    continue
-                price_text, stars = price_of(g)
-                if seen.get(g.id) == price_text:
-                    continue
-                seen[g.id] = price_text
-                if first:
-                    continue
-                owner_id = g.owner_id.user_id
-                owner_uname = username_of(users_map.get(owner_id))
-                if not owner_uname:
-                    continue
-                asyncio.create_task(post_lot(g, owner_id, owner_uname, gift.id,
-                                             gift.title, price_text, stars))
-            first = False
-        except asyncio.CancelledError:
-            raise
+            now = time.time()
+            if now - floor_ts.get(gid, 0) > FLOOR_EVERY:
+                r = await user(functions.payments.GetResaleStarGiftsRequest(
+                    gift_id=gid, sort_by_price=True, offset="", limit=1))
+                floor_ts[gid] = now
+                if r.gifts:
+                    _, s = price_of(r.gifts[0])
+                    if s:
+                        floor_cache[gid] = s
+            else:
+                baseline = gid not in baselined
+                baselined.add(gid)
+                r = await user(functions.payments.GetResaleStarGiftsRequest(
+                    gift_id=gid, offset="", limit=LIMIT))
+                handle_listing(gid, r, baseline)
+            # успешный запрос — медленно возвращаемся к целевому темпу
+            state["interval"] = max(60 / cfg["rate"], state["interval"] * 0.97)
         except errors.FloodWaitError as e:
-            log.warning("[%s] FloodWait %ss", gift.title, e.seconds)
-            await asyncio.sleep(e.seconds + 1)
+            state["interval"] = min(state["interval"] * 2, 300)
+            log.warning("FloodWait %ss, темп снижен до %.1f сек/запрос", e.seconds, state["interval"])
+            await asyncio.sleep(e.seconds + 5)
+            continue
         except Exception:
-            log.exception("[%s] ошибка опроса", gift.title)
-            await asyncio.sleep(3)
-        await asyncio.sleep(POLL_EVERY)
+            log.exception("Ошибка запроса по коллекции %s", gid)
+        await asyncio.sleep(state["interval"])
 
 
 # ───────────── занятие лога ─────────────
@@ -406,15 +413,26 @@ async def on_msg(e):
             cur = cfg["watch"] or chosen_ids()
             cfg["watch"] = [i for i in cur if i not in ids]
         save_cfg()
-        sync_tasks()
         verb = "Добавил" if cmd == "/watch" else "Убрал"
         await e.respond(f"{verb}: {', '.join(g.title for g in found)}", parse_mode=None)
 
     elif cmd == "/auto":
         cfg["watch"] = []
         save_cfg()
-        sync_tasks()
         await e.respond(f"Авто-режим: топ-{TOP_N} коллекций.", parse_mode=None)
+
+    elif cmd == "/rate":
+        try:
+            n = int(arg)
+            if not 1 <= n <= 30:
+                raise ValueError
+        except ValueError:
+            await e.respond("Пример: /rate 8  (от 1 до 30 запросов в минуту)", parse_mode=None)
+            return
+        cfg["rate"] = n
+        state["interval"] = 60 / n
+        save_cfg()
+        await e.respond(f"✅ Темп: {n} запросов в минуту.", parse_mode=None)
 
     elif cmd == "/tier":
         parts = arg.split()
@@ -436,6 +454,7 @@ async def on_msg(e):
         t = cfg.get("topics") or {}
         await e.respond(
             f"Слежу ({mode}): {names}\n"
+            f"Темп: {cfg['rate']} запр/мин, сейчас пауза {state['interval']:.1f} сек\n"
             f"Темы: дёшево={t.get('cheap', '—')} средне={t.get('mid', '—')} дорого={t.get('expensive', '—')}",
             parse_mode=None,
         )
@@ -469,8 +488,7 @@ async def main():
     await load_gifts()
     bot.add_event_handler(on_msg, events.NewMessage(incoming=True))
     bot.add_event_handler(on_callback, events.CallbackQuery)
-    sync_tasks()
-    asyncio.create_task(floor_refresher())
+    asyncio.create_task(scheduler())
     me = await bot.get_me()
     log.info("Готово! @%s, напиши в группе /here.", me.username)
     await asyncio.gather(bot.run_until_disconnected(), user.run_until_disconnected())
